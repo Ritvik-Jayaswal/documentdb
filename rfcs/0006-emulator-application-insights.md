@@ -2,7 +2,7 @@
 rfc: 0006
 title: "Application Insights Telemetry for DocumentDB Local Emulator"
 status: Draft
-owner: "@github-username"
+owner: "@Ritvik-Jayaswal"
 issue: "https://github.com/documentdb/documentdb/issues/XXX"
 discussion: "https://github.com/documentdb/documentdb/discussions/XXX"
 version-target: 1.0
