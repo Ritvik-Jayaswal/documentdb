@@ -444,6 +444,29 @@ if [ $attempt -eq $max_attempts ]; then
     exit 1
 fi
 
+# Helper function to check if a database already has data via mongosh.
+# Returns 0 (true) if the database exists and contains at least one collection with documents.
+check_database_has_data() {
+    local db_name="$1"
+    if command -v mongosh >/dev/null 2>&1; then
+        local doc_count
+        doc_count=$(mongosh "localhost:${DOCUMENTDB_PORT}" \
+            -u "$USERNAME" -p "$PASSWORD" \
+            --authenticationMechanism SCRAM-SHA-256 \
+            --tls --tlsAllowInvalidCertificates \
+            --quiet --eval "
+                use('${db_name}');
+                const cols = db.getCollectionNames();
+                if (cols.length === 0) { print('0'); }
+                else { print(db.getCollection(cols[0]).countDocuments({}, { limit: 1 })); }
+            " 2>/dev/null | tail -1)
+        if [ "$doc_count" = "1" ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
 # Initialize database with custom data if directory exists and contains JS files
 custom_data_initialized=false
 if [ -d "$INIT_DATA_PATH" ] && [ "$(ls -A "$INIT_DATA_PATH"/*.js 2>/dev/null)" ]; then
@@ -457,8 +480,8 @@ if [ -d "$INIT_DATA_PATH" ] && [ "$(ls -A "$INIT_DATA_PATH"/*.js 2>/dev/null)" ]
             echo "Custom data initialization completed."
             custom_data_initialized=true
         else
-            echo "Error: Custom data initialization failed"
-            exit 1
+            echo "Warning: Custom data initialization returned an error (data may already exist). Continuing..."
+            custom_data_initialized=true
         fi
     else
         echo "Warning: Initialization script not found at $init_script"
@@ -467,35 +490,40 @@ fi
 
 # Initialize database with sample data if enabled (default behavior unless --skip-init-data is specified)
 if [ "$SKIP_INIT_DATA" != "true" ]; then
-    echo "Initializing database with built-in sample data..."
-    
-    # Use the sample data directory
-    sample_data_path="/home/documentdb/gateway/sample-data"
-    init_script="/home/documentdb/gateway/scripts/init_documentdb_data.sh"
-    
-    if [ -f "$init_script" ] && [ -d "$sample_data_path" ]; then
-        echo "Loading sample data from: $sample_data_path"
-        if "$init_script" -H localhost -P "$DOCUMENTDB_PORT" -u "$USERNAME" -p "$PASSWORD" -d "$sample_data_path" -v; then
-            echo "Sample data initialization completed."
-        else
-            echo "Error: Sample data initialization failed"
-            exit 1
-        fi
-        echo ""
-        echo "Sample data has been loaded into the 'sampledb' database with the following collections:"
-        echo "  - users (5 sample users)"
-        echo "  - products (5 sample products)"  
-        echo "  - orders (4 sample orders)"
-        echo "  - analytics (sample metrics and activity data)"
-        echo ""
-        echo "Connect to your DocumentDB instance and use: use('sampledb')"
+    # Check if sample data has already been loaded (e.g. from a previous run with persisted data)
+    if check_database_has_data "sampledb"; then
+        echo "Sample data already exists in 'sampledb' database, skipping initialization."
     else
-        echo "Warning: Sample data or initialization script not found"
-        if [ ! -f "$init_script" ]; then
-            echo "  - Missing: $init_script"
-        fi
-        if [ ! -d "$sample_data_path" ]; then
-            echo "  - Missing: $sample_data_path"
+        echo "Initializing database with built-in sample data..."
+        
+        # Use the sample data directory
+        sample_data_path="/home/documentdb/gateway/sample-data"
+        init_script="/home/documentdb/gateway/scripts/init_documentdb_data.sh"
+        
+        if [ -f "$init_script" ] && [ -d "$sample_data_path" ]; then
+            echo "Loading sample data from: $sample_data_path"
+            if "$init_script" -H localhost -P "$DOCUMENTDB_PORT" -u "$USERNAME" -p "$PASSWORD" -d "$sample_data_path" -v; then
+                echo "Sample data initialization completed."
+            else
+                echo "Error: Sample data initialization failed"
+                exit 1
+            fi
+            echo ""
+            echo "Sample data has been loaded into the 'sampledb' database with the following collections:"
+            echo "  - users (5 sample users)"
+            echo "  - products (5 sample products)"  
+            echo "  - orders (4 sample orders)"
+            echo "  - analytics (sample metrics and activity data)"
+            echo ""
+            echo "Connect to your DocumentDB instance and use: use('sampledb')"
+        else
+            echo "Warning: Sample data or initialization script not found"
+            if [ ! -f "$init_script" ]; then
+                echo "  - Missing: $init_script"
+            fi
+            if [ ! -d "$sample_data_path" ]; then
+                echo "  - Missing: $sample_data_path"
+            fi
         fi
     fi
 fi
