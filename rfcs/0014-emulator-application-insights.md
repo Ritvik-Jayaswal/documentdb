@@ -1,5 +1,5 @@
 ---
-rfc: 0006
+rfc: 0014
 title: "Application Insights Telemetry for DocumentDB Local Emulator"
 status: Draft
 owner: "@Ritvik-Jayaswal"
@@ -10,7 +10,7 @@ implementations:
   - "https://github.com/documentdb/documentdb/pull/XXX"
 ---
 
-# RFC-0006: Application Insights Telemetry for DocumentDB Local Emulator
+# RFC-0014: Application Insights Telemetry for DocumentDB Local Emulator
 
 ## Problem
 
