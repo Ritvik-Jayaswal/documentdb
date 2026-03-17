@@ -100,12 +100,12 @@ Optional arguments:
   --init-data-path [PATH]
                         Specify a directory containing JavaScript files for database initialization.
                         Files will be executed in alphabetical order using mongosh.
-                        When this option is used, built-in sample data is automatically disabled.
                         Defaults to /init_doc_db.d
                         Overrides INIT_DATA_PATH environment variable.
-  --skip-init-data      Skip initialization with built-in sample data.
-                        By default, sample collections (users, products, orders, analytics) in 'sampledb' database will be created.
-                        Overrides SKIP_INIT_DATA environment variable.
+  --load-sample-data    Load built-in sample data on first run.
+                        Creates sample collections (users, products, orders, analytics) in the 'sampledb' database.
+                        Sample data is only loaded once; a marker file in the data directory prevents re-initialization on restart.
+                        Overrides LOAD_SAMPLE_DATA environment variable.
   --disable-extended-rum
                         Disable the use of extended_rum for indexes.
                         By default, extended rum is enabled.
@@ -199,11 +199,10 @@ do
     --init-data-path)
         shift
         export INIT_DATA_PATH=$1
-        export SKIP_INIT_DATA=true  # Disable built-in sample data when custom path is provided
         shift;;
 
-    --skip-init-data)
-        export SKIP_INIT_DATA=true
+    --load-sample-data)
+        export LOAD_SAMPLE_DATA=true
         shift;;
 
     --disable-extended-rum)
@@ -226,7 +225,7 @@ export PASSWORD=${PASSWORD:-Admin100}
 export CREATE_USER=${CREATE_USER:-true}
 export START_POSTGRESQL=${START_POSTGRESQL:-true}
 export INIT_DATA_PATH=${INIT_DATA_PATH:-/init_doc_db.d}
-export SKIP_INIT_DATA=${SKIP_INIT_DATA:-false}
+export LOAD_SAMPLE_DATA=${LOAD_SAMPLE_DATA:-false}
 export DISABLE_EXTENDED_RUM=${DISABLE_EXTENDED_RUM:-false}
 
 # Setup centralized log directory structure
@@ -293,10 +292,10 @@ if [ -n "$LOG_LEVEL" ] && \
     exit 1
 fi
 
-if [ -n "$SKIP_INIT_DATA" ] && \
-   [ "$SKIP_INIT_DATA" != "true" ] && \
-   [ "$SKIP_INIT_DATA" != "false" ]; then
-    echo "Invalid skip-init-data value $SKIP_INIT_DATA, must be true or false"
+if [ -n "$LOAD_SAMPLE_DATA" ] && \
+   [ "$LOAD_SAMPLE_DATA" != "true" ] && \
+   [ "$LOAD_SAMPLE_DATA" != "false" ]; then
+    echo "Invalid load-sample-data value $LOAD_SAMPLE_DATA, must be true or false"
     exit 1
 fi
 
@@ -444,55 +443,39 @@ if [ $attempt -eq $max_attempts ]; then
     exit 1
 fi
 
-# Helper function to check if a database already has data via mongosh.
-# Returns 0 (true) if the database exists and contains at least one collection with documents.
-check_database_has_data() {
-    local db_name="$1"
-    if command -v mongosh >/dev/null 2>&1; then
-        local doc_count
-        doc_count=$(mongosh "localhost:${DOCUMENTDB_PORT}" \
-            -u "$USERNAME" -p "$PASSWORD" \
-            --authenticationMechanism SCRAM-SHA-256 \
-            --tls --tlsAllowInvalidCertificates \
-            --quiet --eval "
-                use('${db_name}');
-                const cols = db.getCollectionNames();
-                if (cols.length === 0) { print('0'); }
-                else { print(db.getCollection(cols[0]).countDocuments({}, { limit: 1 })); }
-            " 2>/dev/null | tail -1)
-        if [ "$doc_count" = "1" ]; then
-            return 0
-        fi
-    fi
-    return 1
-}
-
 # Initialize database with custom data if directory exists and contains JS files
+CUSTOM_INIT_MARKER="$DATA_PATH/.custom_data_initialized"
 custom_data_initialized=false
 if [ -d "$INIT_DATA_PATH" ] && [ "$(ls -A "$INIT_DATA_PATH"/*.js 2>/dev/null)" ]; then
-    echo "Initializing database with custom data from: $INIT_DATA_PATH"
-    
-    # Use the dedicated initialization script
-    init_script="/home/documentdb/gateway/scripts/init_documentdb_data.sh"
-    if [ -f "$init_script" ]; then
-        echo "Using custom initialization data from: $INIT_DATA_PATH"
-        if "$init_script" -H localhost -P "$DOCUMENTDB_PORT" -u "$USERNAME" -p "$PASSWORD" -d "$INIT_DATA_PATH" -v; then
-            echo "Custom data initialization completed."
-            custom_data_initialized=true
-        else
-            echo "Warning: Custom data initialization returned an error (data may already exist). Continuing..."
-            custom_data_initialized=true
-        fi
+    if [ -f "$CUSTOM_INIT_MARKER" ]; then
+        echo "Custom data already initialized (marker file found at $CUSTOM_INIT_MARKER), skipping."
+        custom_data_initialized=true
     else
-        echo "Warning: Initialization script not found at $init_script"
+        echo "Initializing database with custom data from: $INIT_DATA_PATH"
+        
+        # Use the dedicated initialization script
+        init_script="/home/documentdb/gateway/scripts/init_documentdb_data.sh"
+        if [ -f "$init_script" ]; then
+            echo "Using custom initialization data from: $INIT_DATA_PATH"
+            if "$init_script" -H localhost -P "$DOCUMENTDB_PORT" -u "$USERNAME" -p "$PASSWORD" -d "$INIT_DATA_PATH" -v; then
+                echo "Custom data initialization completed."
+                touch "$CUSTOM_INIT_MARKER"
+                custom_data_initialized=true
+            else
+                echo "Warning: Custom data initialization returned an error. Continuing..."
+                custom_data_initialized=true
+            fi
+        else
+            echo "Warning: Initialization script not found at $init_script"
+        fi
     fi
 fi
 
-# Initialize database with sample data if enabled (default behavior unless --skip-init-data is specified)
-if [ "$SKIP_INIT_DATA" != "true" ]; then
-    # Check if sample data has already been loaded (e.g. from a previous run with persisted data)
-    if check_database_has_data "sampledb"; then
-        echo "Sample data already exists in 'sampledb' database, skipping initialization."
+# Initialize database with built-in sample data if opted in via --load-sample-data
+if [ "$LOAD_SAMPLE_DATA" = "true" ]; then
+    SAMPLE_INIT_MARKER="$DATA_PATH/.sample_data_initialized"
+    if [ -f "$SAMPLE_INIT_MARKER" ]; then
+        echo "Sample data already initialized (marker file found at $SAMPLE_INIT_MARKER), skipping."
     else
         echo "Initializing database with built-in sample data..."
         
@@ -504,6 +487,7 @@ if [ "$SKIP_INIT_DATA" != "true" ]; then
             echo "Loading sample data from: $sample_data_path"
             if "$init_script" -H localhost -P "$DOCUMENTDB_PORT" -u "$USERNAME" -p "$PASSWORD" -d "$sample_data_path" -v; then
                 echo "Sample data initialization completed."
+                touch "$SAMPLE_INIT_MARKER"
             else
                 echo "Error: Sample data initialization failed"
                 exit 1
@@ -528,9 +512,8 @@ if [ "$SKIP_INIT_DATA" != "true" ]; then
     fi
 fi
 
-if [ "$custom_data_initialized" = "false" ] && [ "$SKIP_INIT_DATA" = "true" ]; then
-    echo "No initialization data loaded (--skip-init-data was specified)."
-    echo "To load data: use --init-data-path [PATH] for custom data, or remove --skip-init-data for built-in sample data."
+if [ "$custom_data_initialized" = "false" ] && [ "$LOAD_SAMPLE_DATA" != "true" ]; then
+    echo "No sample data loaded. To load built-in sample data, use --load-sample-data."
 fi
 # Also stream existing gateway logs (for historical logs that might already exist)
 if [ -f "$GATEWAY_LOG" ]; then
