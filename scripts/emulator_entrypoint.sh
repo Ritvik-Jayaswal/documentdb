@@ -443,7 +443,9 @@ if [ $attempt -eq $max_attempts ]; then
     exit 1
 fi
 
-# Initialize database with custom data if directory exists and contains JS files
+# Initialize database with custom data if directory exists and contains JS files.
+# NOTE: Custom data (--init-data-path) is independent of --load-sample-data.
+# Users can use either, both, or neither.
 CUSTOM_INIT_MARKER="$DATA_PATH/.custom_data_initialized"
 custom_data_initialized=false
 if [ -d "$INIT_DATA_PATH" ] && [ "$(ls -A "$INIT_DATA_PATH"/*.js 2>/dev/null)" ]; then
@@ -463,6 +465,8 @@ if [ -d "$INIT_DATA_PATH" ] && [ "$(ls -A "$INIT_DATA_PATH"/*.js 2>/dev/null)" ]
                 custom_data_initialized=true
             else
                 echo "Warning: Custom data initialization returned an error. Continuing..."
+                # Still write marker so we don't retry on every restart
+                touch "$CUSTOM_INIT_MARKER"
                 custom_data_initialized=true
             fi
         else
@@ -501,13 +505,14 @@ if [ "$LOAD_SAMPLE_DATA" = "true" ]; then
             echo ""
             echo "Connect to your DocumentDB instance and use: use('sampledb')"
         else
-            echo "Warning: Sample data or initialization script not found"
+            echo "Error: Sample data or initialization script not found (--load-sample-data was requested)"
             if [ ! -f "$init_script" ]; then
                 echo "  - Missing: $init_script"
             fi
             if [ ! -d "$sample_data_path" ]; then
                 echo "  - Missing: $sample_data_path"
             fi
+            exit 1
         fi
     fi
 fi
