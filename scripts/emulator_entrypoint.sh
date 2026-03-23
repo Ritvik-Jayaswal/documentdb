@@ -385,6 +385,16 @@ if [ "$START_POSTGRESQL" = "true" ]; then
         i=$((i + 1))
     done
     echo "PostgreSQL is running."
+
+    # Optimize index build performance for the local emulator.
+    # These settings reduce index creation latency from ~3s to <1s per index:
+    #   indexBuildScheduleInSec: pg_cron interval (2s -> 1s, halves worst-case wait)
+    #   indexBuildWaitSleepTimeInMilliSec: gateway poll interval (1000ms -> 100ms)
+    echo "Applying emulator-optimized index build settings..."
+    psql -p $POSTGRESQL_PORT -d postgres -c "ALTER SYSTEM SET documentdb.indexBuildScheduleInSec = 1;" 2>/dev/null
+    psql -p $POSTGRESQL_PORT -d postgres -c "ALTER SYSTEM SET documentdb.indexBuildWaitSleepTimeInMilliSec = 100;" 2>/dev/null
+    psql -p $POSTGRESQL_PORT -d postgres -c "SELECT pg_reload_conf();" 2>/dev/null
+    echo "Index build settings applied."
 else
     echo "Skipping PostgreSQL server start."
 fi
