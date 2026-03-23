@@ -424,13 +424,17 @@ fi
 
 gateway_pid=$! # Capture the PID of the gateway process
 
-# Wait for the gateway to be ready before attempting initialization
+# Wait for the gateway to be ready before attempting initialization.
+# We check /proc/net/tcp6 for a LISTEN socket on the gateway port to avoid
+# making a raw TCP connection that would crash the TLS-enabled gateway.
 echo "Waiting for gateway to be ready..."
+GATEWAY_PORT_HEX=$(printf '%04X' "$DOCUMENTDB_PORT")
 max_attempts=60
 attempt=0
 while [ $attempt -lt $max_attempts ]; do
-    if nc -z localhost "$DOCUMENTDB_PORT"; then
-        echo "Gateway is ready on localhost:$DOCUMENTDB_PORT"
+    if grep -q ":${GATEWAY_PORT_HEX} " /proc/net/tcp6 2>/dev/null && \
+       grep ":${GATEWAY_PORT_HEX} " /proc/net/tcp6 2>/dev/null | grep -q ' 0A '; then
+        echo "Gateway is listening on port $DOCUMENTDB_PORT"
         break
     fi
     echo "Attempt $((attempt + 1))/$max_attempts: Gateway not ready yet, waiting..."
