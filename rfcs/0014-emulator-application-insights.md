@@ -29,16 +29,16 @@ The DocumentDB local emulator lacks structured, actionable telemetry. Without it
 
 ### Current State
 
-The emulator entrypoint already exposes a `--disable-telemetry` flag (and `USAGE_TRACKING` environment variable) in [`scripts/emulator_entrypoint.sh`](../scripts/emulator_entrypoint.sh), but the flag is only validated — it is never forwarded to the gateway component or used to enable any telemetry pipeline. No telemetry data is currently collected or transmitted.
+The emulator entrypoint already exposes an `--enable-telemetry` flag (and `ENABLE_TELEMETRY` environment variable) in [`scripts/emulator_entrypoint.sh`](../scripts/emulator_entrypoint.sh), but the flag is only validated — it is never forwarded to the gateway component or used to enable any telemetry pipeline. No telemetry data is currently collected or transmitted. This RFC proposes renaming the flag to `--disable-telemetry` (with `USAGE_TRACKING` as the environment variable) to reflect the opt-out model described below.
 
 A comparable implementation was completed for the DocumentDB Kubernetes Operator ([PR #237](https://github.com/documentdb/documentdb-kubernetes-operator/pull/237)), which integrated the Microsoft Application Insights Go SDK, wired telemetry into controllers, and exposed Helm chart configuration for the connection string. This RFC adapts that approach for the emulator context.
 
 ### Success Criteria
 
-1. By default (when `USAGE_TRACKING=true` or `--disable-telemetry` is not passed), the emulator emits structured events to Application Insights without any observable impact on functional behavior.
+1. By default (telemetry is enabled unless explicitly disabled), the emulator emits structured events to Application Insights without any observable impact on functional behavior.
 2. No personally identifiable information (PII), credentials, collection names, field names, or raw query values are ever transmitted.
 3. Telemetry captures all MongoDB operation types (find, aggregate, insert, update, delete, and all command subtypes) with a focus on operations that produce errors, without capturing actual values.
-4. Users can opt out at any time by passing `--disable-telemetry` or setting `USAGE_TRACKING=false`.
+4. Users can opt out at any time by passing `--disable-telemetry` or setting `USAGE_TRACKING=false` (proposed rename from the existing `ENABLE_TELEMETRY`).
 5. Telemetry is silently disabled if the Application Insights connection string is absent or malformed, with a single log warning — it must never crash the emulator.
 
 ---
@@ -47,7 +47,7 @@ A comparable implementation was completed for the DocumentDB Kubernetes Operator
 
 ### Proposed Solution
 
-Deploy the [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) as an additional component inside the emulator container, managed entirely by the existing entrypoint script. The collector hosts **two independent pipelines**:
+Deploy the [OpenTelemetry Collector](https://opentelemetry.io/docs/collector/) as an additional component inside the emulator container, managed entirely by the existing entrypoint script. The collector hosts **two independent pipelines** because they have fundamentally different data handling requirements — data sent to App Insights leaves the user's machine and must be PII-scrubbed, while data for the user's own debugging stays local and should retain full detail:
 
 1. **Application Insights pipeline** (PII-scrubbed) — collects gateway operation data and entrypoint lifecycle events, processes them through a scrubbing pipeline to strip all PII, and exports to Application Insights via the `azuremonitorexporter`. This is the focus of this RFC.
 2. **User observability pipeline** (no PII restrictions) — forwards gateway logs, PostgreSQL logs, and script logs to a local endpoint or stdout for the user's own debugging and monitoring. This pipeline has no PII filtering since the data never leaves the user's machine.
@@ -73,9 +73,9 @@ The emulator entrypoint script ([`scripts/emulator_entrypoint.sh`](../scripts/em
 
 ### Technical Details
 
-#### OTel Collector Pipeline
+#### OTel Collector Configuration
 
-The OpenTelemetry Collector runs as a managed child component of the emulator entrypoint. Its configuration (`otelcol-config.yaml`) defines two independent pipelines:
+The OpenTelemetry Collector is a single binary that runs as a managed child component of the emulator entrypoint. Its configuration file (`otelcol-config.yaml`) defines two independent *pipelines* — a pipeline being an OTel Collector concept consisting of receivers, processors, and exporters wired together:
 
 ##### Pipeline 1: Application Insights (PII-scrubbed)
 
