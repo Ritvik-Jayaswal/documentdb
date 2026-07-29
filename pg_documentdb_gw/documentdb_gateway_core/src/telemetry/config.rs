@@ -16,6 +16,7 @@ use serde::Deserialize;
 
 use crate::telemetry::{
     metrics::{MetricsConfig, MetricsOptions},
+    scarf::{ScarfConfig, ScarfOptions},
     tracing_export::{TracingConfig, TracingOptions},
 };
 
@@ -72,6 +73,8 @@ pub struct TelemetryOptions {
     pub metrics: Option<MetricsOptions>,
     /// Tracing configuration
     pub tracing: Option<TracingOptions>,
+    /// Scarf usage-telemetry configuration
+    pub scarf: Option<ScarfOptions>,
 }
 
 // ============================================================================
@@ -85,6 +88,7 @@ pub struct TelemetryConfig {
     service_version: Option<String>,
     metrics: MetricsConfig,
     tracing: TracingConfig,
+    scarf: ScarfConfig,
 }
 
 impl TelemetryConfig {
@@ -97,6 +101,7 @@ impl TelemetryConfig {
             service_version: json.service_version,
             metrics: MetricsConfig::new(json.metrics.as_ref()),
             tracing: TracingConfig::new(json.tracing.as_ref()),
+            scarf: ScarfConfig::new(json.scarf.as_ref()),
         }
     }
 
@@ -124,6 +129,11 @@ impl TelemetryConfig {
     #[must_use]
     pub const fn tracing(&self) -> &TracingConfig {
         &self.tracing
+    }
+
+    #[must_use]
+    pub const fn scarf(&self) -> &ScarfConfig {
+        &self.scarf
     }
 
     /// Returns true if any telemetry signal is enabled.

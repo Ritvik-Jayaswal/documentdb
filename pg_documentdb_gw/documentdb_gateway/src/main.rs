@@ -32,7 +32,7 @@ use documentdb_gateway_core::{
     service::TlsProvider,
     shutdown_controller::SHUTDOWN_CONTROLLER,
     startup::{create_postgres_object, get_service_context},
-    telemetry::{TelemetryConfig, TelemetryManager},
+    telemetry::{init_scarf_telemetry, TelemetryConfig, TelemetryManager},
     time::STARTUP_INSTANT,
 };
 use tokio::{signal, time::Instant};
@@ -94,6 +94,10 @@ async fn start_gateway(setup_configuration: DocumentDBSetupConfiguration) {
     };
 
     bootstrap::init_tracing_with_telemetry(telemetry_manager.as_ref());
+
+    // Optional open-source usage telemetry to Scarf (disabled by default; honors
+    // DO_NOT_TRACK / SCARF_NO_ANALYTICS). Independent of the OTLP pipeline above.
+    init_scarf_telemetry(telemetry_config.scarf());
 
     tracing::info!(
         "Tracing subscriber installed (otel_traces_enabled={})",

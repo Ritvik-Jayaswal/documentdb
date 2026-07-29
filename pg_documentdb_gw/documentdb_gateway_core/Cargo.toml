@@ -29,6 +29,7 @@ opentelemetry.workspace = true
 opentelemetry-otlp.workspace = true
 opentelemetry_sdk.workspace = true
 rand.workspace = true
+reqwest.workspace = true
 regex.workspace = true
 scc.workspace = true
 serde.workspace = true

@@ -37,9 +37,13 @@ impl ServiceContext {
         connection_pool_manager: Arc<PoolManager>,
         tls_provider: TlsProvider,
     ) -> Self {
-        let request_metrics_enabled = TelemetryConfig::new(setup_configuration.telemetry_options())
-            .metrics()
-            .metrics_enabled();
+        // Per-request recording drives both the OTLP counters and the Scarf
+        // usage-telemetry shadow counters, so it must run when EITHER signal is
+        // enabled (otherwise enabling Scarf alone would never populate the
+        // aggregated summary).
+        let telemetry_config = TelemetryConfig::new(setup_configuration.telemetry_options());
+        let request_metrics_enabled =
+            telemetry_config.metrics().metrics_enabled() || telemetry_config.scarf().enabled();
         let timeout_secs = setup_configuration.transaction_timeout_secs();
         let cursor_store = CursorStore::with_reaper(Arc::clone(&dynamic_configuration), true);
         let transaction_store = TransactionStore::new(Duration::from_secs(timeout_secs));

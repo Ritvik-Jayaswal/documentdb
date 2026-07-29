@@ -19,6 +19,7 @@ use opentelemetry_sdk::{
     metrics::{PeriodicReader, SdkMeterProvider, Temporality},
     Resource,
 };
+use openssl::sha::sha256;
 use serde::Deserialize;
 
 use crate::{
@@ -240,6 +241,23 @@ static GATEWAY_METRICS: LazyLock<GatewayMetrics> = LazyLock::new(|| {
     }
 });
 
+/// Hashes a user-defined identifier (e.g. collection or database name) into a
+/// stable, non-reversible token so raw user-defined names never appear in
+/// emitted telemetry attributes.
+///
+/// Returns the first 16 hex characters of the SHA-256 digest, which is enough
+/// to correlate the same identifier across events without revealing its value.
+/// Internal sentinel values (empty string for database-level operations, and
+/// the `"unknown"` placeholder) are passed through unchanged since they are not
+/// user-defined and carry no privacy risk.
+fn hash_identifier(name: &str) -> String {
+    if name.is_empty() || name == "unknown" {
+        return name.to_owned();
+    }
+    let digest = sha256(name.as_bytes());
+    hex::encode(&digest[..8])
+}
+
 /// Records request-level metrics directly in the request handling path.
 ///
 /// See: <https://opentelemetry.io/docs/specs/semconv/database/database-metrics/>
@@ -270,14 +288,15 @@ pub fn record_gateway_metrics(
     let mut base_attrs: Vec<KeyValue> = vec![
         KeyValue::new("db.system.name", "documentdb"),
         KeyValue::new("db.operation.name", operation),
-        KeyValue::new("db.collection.name", collection.to_owned()),
-        KeyValue::new("db.namespace", db_name.to_owned()),
+        KeyValue::new("db.collection.name", hash_identifier(collection)),
+        KeyValue::new("db.namespace", hash_identifier(db_name)),
     ];
     if let Either::Right((err, _)) = &response {
         base_attrs.push(KeyValue::new("error.type", err.error_code().to_string()));
     }
 
     metrics.operations_count.add(1, &base_attrs);
+    crate::telemetry::scarf::record_operation();
     metrics
         .operation_duration_total
         .add(duration_to_secs(duration_ns), &base_attrs);
@@ -353,31 +372,32 @@ fn record_document_counts(
                     .map_or(0, |arr| arr.into_iter().count() as u64);
                 if batch_len > 0 {
                     metrics.documents_returned.add(batch_len, attrs);
+                    crate::telemetry::scarf::record_document_deltas(0, batch_len, 0, 0);
                 }
             }
         }
         RequestType::Insert => {
             // Insert response: { n: <count> }
             if let Ok(n) = doc.get_i32("n") {
-                metrics
-                    .documents_inserted
-                    .add(u64::from(n.max(0).cast_unsigned()), attrs);
+                let count = u64::from(n.max(0).cast_unsigned());
+                metrics.documents_inserted.add(count, attrs);
+                crate::telemetry::scarf::record_document_deltas(count, 0, 0, 0);
             }
         }
         RequestType::Update | RequestType::FindAndModify => {
             // Update response: { nModified: <count> }
             if let Ok(n) = doc.get_i32("nModified") {
-                metrics
-                    .documents_updated
-                    .add(u64::from(n.max(0).cast_unsigned()), attrs);
+                let count = u64::from(n.max(0).cast_unsigned());
+                metrics.documents_updated.add(count, attrs);
+                crate::telemetry::scarf::record_document_deltas(0, 0, count, 0);
             }
         }
         RequestType::Delete => {
             // Delete response: { n: <count> }
             if let Ok(n) = doc.get_i32("n") {
-                metrics
-                    .documents_deleted
-                    .add(u64::from(n.max(0).cast_unsigned()), attrs);
+                let count = u64::from(n.max(0).cast_unsigned());
+                metrics.documents_deleted.add(count, attrs);
+                crate::telemetry::scarf::record_document_deltas(0, 0, 0, count);
             }
         }
         _ => {}
@@ -444,6 +464,28 @@ pub fn record_startup_metrics(duration: Duration) {
 mod tests {
     use super::*;
     use crate::testing::EnvGuard;
+
+    #[test]
+    fn test_hash_identifier_hashes_user_defined_names() {
+        // Real user-defined names are replaced with a stable, non-reversible token.
+        let hashed = hash_identifier("my_secret_collection");
+        assert_ne!(hashed, "my_secret_collection");
+        assert_eq!(hashed.len(), 16);
+        assert!(hashed.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Hashing is deterministic so the same name always maps to the same token.
+        assert_eq!(hashed, hash_identifier("my_secret_collection"));
+
+        // Distinct names produce distinct tokens.
+        assert_ne!(hash_identifier("orders"), hash_identifier("users"));
+    }
+
+    #[test]
+    fn test_hash_identifier_preserves_sentinels() {
+        // Internal sentinels are not user-defined and pass through unchanged.
+        assert_eq!(hash_identifier(""), "");
+        assert_eq!(hash_identifier("unknown"), "unknown");
+    }
 
     #[test]
     fn test_metrics_config_uses_env_var() {
