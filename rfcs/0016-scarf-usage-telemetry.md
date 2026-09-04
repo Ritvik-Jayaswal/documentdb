@@ -76,10 +76,12 @@ using two complementary, independent mechanisms:
    command — and captures **downloads**.
 
 2. **Runtime usage telemetry (deployment counting).** Add a small, optional,
-   privacy-respecting telemetry emitter to the gateway that sends two
-   low-frequency, aggregated events to a Scarf Event Collection endpoint: a
-   one-time **launch** event and a periodic **aggregated summary**. This
-   captures **real running deployments**, which downloads cannot.
+   privacy-respecting telemetry emitter to the **`documentdb-local` container
+   entrypoint scripts** that sends two low-frequency events to a Scarf Event
+   Collection endpoint: a one-time **launch** event and a periodic
+   **heartbeat**. This captures **real running deployments** of
+   `documentdb-local`, which downloads cannot. The OSS gateway
+   (`pg_documentdb_gw`) is deliberately left untouched (see below).
 
 ### Why Scarf
 
@@ -101,8 +103,8 @@ version/platform. Together they give an adoption funnel (downloaded → run).
 
 ### Key tradeoffs
 
-- **Runtime telemetry is inherently a network call from the user's process.**
-  We mitigate this by making it **off by default**, opt-in, aggregated,
+- **Runtime telemetry is inherently a network call from the container.**
+  We mitigate this by making it **off by default**, opt-in, low-frequency,
   fire-and-forget, and fully documented — following Scarf's own best-practice
   guidance (low-frequency, high-intent events only).
 - **A user-facing documentation change** is required for download tracking (the
@@ -111,11 +113,24 @@ version/platform. Together they give an adoption funnel (downloaded → run).
 
 ### Fit with existing architecture
 
-The runtime emitter lives in the gateway (`pg_documentdb_gw`) alongside, but
-strictly separate from, the existing OpenTelemetry telemetry. It reuses the
-existing `TelemetryConfig` / `SetupConfiguration` configuration pattern and the
-existing async (Tokio) runtime. It never participates in the request/response
-data path beyond incrementing in-process counters.
+The runtime emitter lives entirely in the **`documentdb-local` container
+entrypoint scripts** (`documentdb-local/scripts/`), alongside — but strictly
+separate from — the container's existing PostgreSQL and gateway startup logic.
+It runs as a lightweight background process spawned by `emulator_entrypoint.sh`,
+uses only tools already present in the image (`curl`, `uname`), and never
+touches the request/response data path. It is independent of the gateway's
+existing OpenTelemetry (OTLP) telemetry.
+
+### Why the OSS gateway is deliberately out of scope
+
+The OSS gateway (`pg_documentdb_gw`) is **not** modified by this RFC. That
+gateway is a shared library shipped and run in production environments
+(including hosted pgmongo), where emitting Scarf adoption telemetry from the
+request path would be inappropriate. Scoping runtime telemetry to the
+`documentdb-local` entrypoint scripts keeps adoption measurement confined to the
+local/dev container image that is actually distributed for adoption tracking,
+and guarantees zero behavioral, dependency, or performance impact on the
+production gateway.
 
 ---
 
@@ -131,45 +146,45 @@ are controlled independently and send to different destinations.
 | Audience | The **operator** running the instance | The **maintainers** of the project |
 | Transport | OpenTelemetry OTLP (gRPC) | Plain HTTPS GET to Scarf endpoint |
 | Destination | An endpoint the operator configures (Prometheus, Grafana, App Insights) | Scarf Event Collection endpoint |
-| Granularity | Per-request, high-cardinality | Aggregated, low-frequency |
+| Granularity | Per-request, high-cardinality | Low-frequency (launch + heartbeat) |
 | Toggle | `OTEL_METRICS_ENABLED` (+ `OTEL_*`) | `SCARF_ANALYTICS_ENABLED` |
 | Default | Off | Off |
 
 The rest of this section specifies the Scarf usage telemetry.
 
-### Exactly what the gateway collects and sends
+### Exactly what `documentdb-local` collects and sends
 
-When (and only when) usage telemetry is enabled, the gateway sends HTTPS
-requests to a Scarf Event Collection endpoint. There are exactly **two** event
-types, encoded as URL query parameters (no request body).
+When (and only when) usage telemetry is enabled, the `documentdb-local`
+entrypoint script sends HTTPS requests to a Scarf Event Collection endpoint.
+There are exactly **two** event types, encoded as URL query parameters (no
+request body).
 
-#### Event: `emulator_launch` (sent once, shortly after startup)
+#### Event: `emulator_launch` (sent once, shortly after container startup)
 
 | Field | Example | Meaning |
 |-------|---------|---------|
 | `event` | `emulator_launch` | Event type |
-| `version` | `0.104.0` | Gateway package version (`CARGO_PKG_VERSION`) |
-| `os` | `linux` | Compile-time OS constant |
-| `arch` | `x86_64` | Compile-time CPU architecture constant |
+| `version` | `0.104.0` | `documentdb-local` release version (from `/version.txt`) |
+| `os` | `linux` | Operating system (`uname -s`) |
+| `arch` | `x86_64` | CPU architecture (`uname -m`) |
 | `db_system` | `documentdb` | Constant identifier |
 
-#### Event: `gateway_metrics_summary` (sent periodically; default hourly)
+#### Event: `emulator_heartbeat` (sent periodically; default hourly)
 
-Sent only if there was activity in the interval. All values are **process-wide
-aggregate counts for the interval** — never per-request, never per-collection,
-never per-user.
+A liveness signal that a deployment is still running. It carries only the same
+host attributes as the launch event — no per-request, per-collection, or
+per-user data of any kind. Counting distinct deployments emitting heartbeats
+over time yields the running-deployment signal.
 
 | Field | Example | Meaning |
 |-------|---------|---------|
-| `event` | `gateway_metrics_summary` | Event type |
+| `event` | `emulator_heartbeat` | Event type |
 | `version`, `os`, `arch`, `db_system` | (as above) | Same host attributes |
-| `operations` | `42` | Total operations handled in the interval |
-| `documents_inserted` | `10` | Documents inserted in the interval |
-| `documents_returned` | `55` | Documents returned by reads in the interval |
-| `documents_updated` | `7` | Documents updated in the interval |
-| `documents_deleted` | `3` | Documents deleted in the interval |
 
 That is the complete list of transmitted fields. There are no hidden fields.
+Because the emitter runs in the entrypoint script and has no visibility into the
+gateway's request path, it collects **no** document-throughput or operation
+counts.
 
 ### What is never collected
 
@@ -186,35 +201,34 @@ The emitter never reads, constructs, or transmits:
   it; this is inherent to making a network request, not something the payload
   carries.)
 
-### Privacy hardening: hashing user-defined identifiers everywhere
+### No changes to the OSS gateway or its metrics
 
-Independently of Scarf, the gateway's OTLP operational metrics previously
-attached **raw** user-defined identifiers (database name, collection name) as
-metric attributes. This RFC hashes these at the source so raw user-chosen names
-never enter **any** telemetry attribute — protecting operators' own
-observability backends as well.
-
-- A helper hashes an identifier to the first 16 hex characters of its SHA-256
-  digest (stable and correlatable, non-reversible).
-- Internal sentinels (`""` for database-level operations, `"unknown"`
-  placeholder) pass through unchanged, since they are not user-defined.
-- Non-user-defined attributes (`db.system.name` = `documentdb`, the operation
-  type such as `Insert`/`Find`) are left intact.
-
-The Scarf usage summary never includes collection/namespace at all — hashed or
-otherwise — because it is purely aggregate.
+This RFC does **not** touch the OSS gateway (`pg_documentdb_gw`), its OTLP
+operational metrics, or any of its telemetry attributes. Because the Scarf
+emitter lives in the `documentdb-local` entrypoint scripts and only ever sends
+the constant host attributes listed above, no user-defined identifier (database
+name, collection name, index name, user name) is ever read or transmitted — so
+there is nothing to hash or redact. The gateway's existing OTLP pipeline is
+unchanged.
 
 ### Configuration
 
-Resolution order for each setting: JSON config (`TelemetryOptions.Scarf`) >
-environment variable > built-in default. User opt-out overrides everything.
+All configuration is read by the `documentdb-local` entrypoint scripts from
+environment variables (and the matching entrypoint flags). Resolution order for
+each setting: environment variable / flag > built-in default. User opt-out
+overrides everything.
 
-| Setting | Env var | JSON field | Default |
-|---------|---------|-----------|---------|
-| Enable | `SCARF_ANALYTICS_ENABLED` | `Enabled` | `false` |
-| Endpoint | `SCARF_TELEMETRY_ENDPOINT` | `Endpoint` | `https://documentdb.gateway.scarf.sh/telemetry` |
-| Summary interval (ms) | `SCARF_SUMMARY_INTERVAL_MS` | `SummaryIntervalMs` | `3600000` (1 hour) |
+| Setting | Env var | Entrypoint flag | Default |
+|---------|---------|-----------------|---------|
+| Enable | `SCARF_ANALYTICS_ENABLED` | `--enable-usage-analytics` | `false` |
+| Endpoint | `SCARF_TELEMETRY_ENDPOINT` | — | `https://documentdb.gateway.scarf.sh/telemetry` |
+| Heartbeat interval (s) | `SCARF_HEARTBEAT_INTERVAL_S` | — | `3600` (1 hour) |
 | Opt out | `DO_NOT_TRACK=1` **or** `SCARF_NO_ANALYTICS=1` | — | not set |
+
+This Scarf usage-analytics toggle is separate from the existing
+`--enable-telemetry` / `ENABLE_TELEMETRY` flag (which controls the gateway's
+Azure Application Insights / OTLP operational telemetry) and does not change its
+behavior.
 
 The default endpoint (`documentdb.gateway.scarf.sh`) is a placeholder for an
 **official DocumentDB-owned Scarf organization** that must be registered before
@@ -223,40 +237,42 @@ harmlessly.
 
 ### Technical Details
 
-**Module.** A single new module, `telemetry/scarf.rs`, contains all of:
+**Location.** All logic lives in the `documentdb-local` container scripts
+(`documentdb-local/scripts/`). No Rust, C, or gateway code is added or changed.
 
-- `ScarfOptions` (JSON config, `PascalCase` serde) and `ScarfConfig` (runtime
-  config with the resolution/opt-out logic above).
-- Process-wide shadow counters (`AtomicU64`) for operations and the four
-  document-throughput counts, plus a global `AtomicBool` enable gate.
-- `record_operation()` and `record_document_deltas(...)`: called from the
-  request path; each is a single relaxed atomic load returning immediately when
-  disabled, so there is negligible cost when telemetry is off.
-- `init_scarf_telemetry(&ScarfConfig)`: no-op when disabled/opted-out; otherwise
-  flips the gate, spawns a detached task that sends the launch event, and spawns
-  a detached interval task that drains the counters and sends a summary (skips
-  empty intervals).
-- A shared `reqwest` client with a 3-second timeout.
+**Emitter script.** A single new helper script (e.g.
+`documentdb-local/scripts/scarf_telemetry.sh`) contains all of:
 
-**Counter sourcing.** The Scarf shadow counters are incremented from the same
-place the OTLP document/operation counters are recorded, so both signals derive
-from identical events. Per-request recording therefore runs when **either** OTLP
-metrics **or** Scarf telemetry is enabled. (Prior to this change, per-request
-recording was gated solely on the OTLP toggle; enabling Scarf alone would have
-left the summary empty. This coupling is corrected so the two toggles are
-independent.)
+- Reading and validating configuration from the environment
+  (`SCARF_ANALYTICS_ENABLED`, `SCARF_TELEMETRY_ENDPOINT`,
+  `SCARF_HEARTBEAT_INTERVAL_S`) and honoring `DO_NOT_TRACK` /
+  `SCARF_NO_ANALYTICS`, which always win.
+- Resolving host attributes once: `version` from `/version.txt`, `os` from
+  `uname -s`, `arch` from `uname -m`, `db_system` = `documentdb`.
+- Sending the one-time `emulator_launch` event, then looping to send an
+  `emulator_heartbeat` event every `SCARF_HEARTBEAT_INTERVAL_S` seconds.
+- Each send is a single fire-and-forget `curl` GET with a short timeout
+  (`--max-time 3`), backgrounded so it never blocks startup or serving.
 
-**Fire-and-forget safety.** All network work runs on detached Tokio tasks with a
-3-second timeout; every error is swallowed and logged at debug only. A slow,
-unreachable, blocked, or non-existent telemetry endpoint has **no effect** on
-the database or on request latency.
+**Wiring.** `emulator_entrypoint.sh` starts the emitter as a background process
+after the gateway is confirmed ready, and adds its PID to the existing `cleanup`
+trap so it is terminated on container shutdown alongside the other background
+processes. When analytics is disabled or opted out, the emitter script exits
+immediately and no background loop is started.
+
+**Fire-and-forget safety.** Every request is a backgrounded `curl` with a
+3-second timeout; all output and errors are discarded (redirected to
+`/dev/null`) and logged at most at debug level. A slow, unreachable, blocked, or
+non-existent telemetry endpoint has **no effect** on PostgreSQL, the gateway, or
+client request latency.
 
 ### API Changes
 
 - No changes to any user-facing database API, wire protocol, or UDFs.
-- New public Rust items in `documentdb_gateway_core::telemetry`:
-  `ScarfConfig`, `ScarfOptions`, `init_scarf_telemetry`, `record_operation`,
-  `record_document_deltas`. These are internal gateway APIs, not database APIs.
+- No changes to the OSS gateway (`pg_documentdb_gw`) or its public Rust API.
+- The only additions are container-level: a new entrypoint flag
+  (`--enable-usage-analytics`) and new environment variables consumed by the
+  `documentdb-local` scripts.
 
 ### Database Schema Changes
 
@@ -264,21 +280,23 @@ None.
 
 ### Configuration Changes
 
-- New `TelemetryOptions.Scarf` JSON section (`Enabled`, `Endpoint`,
-  `SummaryIntervalMs`).
-- New environment variables: `SCARF_ANALYTICS_ENABLED`,
-  `SCARF_TELEMETRY_ENDPOINT`, `SCARF_SUMMARY_INTERVAL_MS`.
+- New `documentdb-local` entrypoint flag `--enable-usage-analytics` (off by
+  default).
+- New environment variables consumed by the entrypoint scripts:
+  `SCARF_ANALYTICS_ENABLED`, `SCARF_TELEMETRY_ENDPOINT`,
+  `SCARF_HEARTBEAT_INTERVAL_S`.
 - Honors existing/standard `DO_NOT_TRACK` and `SCARF_NO_ANALYTICS`.
-- New dependency: `reqwest` (HTTP client), built with the platform-native TLS
-  stack to avoid adding an OpenSSL requirement on platforms that lack one.
+- No new build/runtime dependency: the emitter uses `curl`, which is already
+  present in the `documentdb-local` image.
 
 ### Dependency and Build Impact
 
-- Adds `reqwest` to the gateway workspace. Scarf accepts only plain HTTP(S);
-  the existing OTLP exporter uses gRPC/tonic and cannot target a Scarf endpoint,
-  so a lightweight HTTP client is required.
-- No change to build tooling or the runtime image layout; the emitter compiles
-  into the existing gateway binary.
+- No new library dependencies. The emitter is a shell script that uses `curl`
+  (already in the `documentdb-local` image) to make plain HTTPS GET requests to
+  the Scarf endpoint.
+- No change to the gateway workspace, its `Cargo.toml`, or any compiled binary.
+- No change to build tooling; only new scripts are added under
+  `documentdb-local/scripts/` and referenced from `emulator_entrypoint.sh`.
 
 ### Cost
 
@@ -303,37 +321,44 @@ None.
 
 ### Testing Strategy
 
-- **Unit tests** (in `scarf.rs`): default-disabled; enabled via JSON; opt-out
-  overrides explicit enable; endpoint default vs. override; counters are no-ops
-  when disabled and accumulate correctly when enabled.
-- **Unit tests** (in `metrics.rs`): `hash_identifier` hashes real names to
-  stable 16-hex tokens, is deterministic, distinct inputs → distinct outputs,
-  and preserves sentinels (`""`, `"unknown"`).
-- **Integration test:** with telemetry enabled and pointed at a local HTTP
-  sink, assert a `emulator_launch` event on startup and a
-  `gateway_metrics_summary` after activity within one interval; assert **no**
-  events are emitted when disabled or when `DO_NOT_TRACK=1`.
-- **Privacy assertion:** verify emitted payloads contain none of: database name,
-  collection name, user name, document content.
+- **Script unit tests:** the emitter script resolves configuration correctly —
+  default-disabled; enabled via `SCARF_ANALYTICS_ENABLED` or
+  `--enable-usage-analytics`; opt-out (`DO_NOT_TRACK` / `SCARF_NO_ANALYTICS`)
+  overrides explicit enable; endpoint default vs. override; host attributes are
+  populated from `/version.txt` and `uname`.
+- **Integration test** (extending the existing container test harness in
+  `documentdb-local/scripts/documentdb_local_tests/test_image.py`, which already
+  exercises telemetry-endpoint behavior): with analytics enabled and pointed at
+  a local HTTP sink, assert an `emulator_launch` event on startup and an
+  `emulator_heartbeat` within one interval; assert **no** events are emitted
+  when disabled or when `DO_NOT_TRACK=1`.
+- **Privacy assertion:** verify emitted payloads contain only the fixed host
+  attributes and none of: database name, collection name, user name, document
+  content.
+- **No-regression assertion:** confirm the OSS gateway build and its tests are
+  unchanged (no gateway sources touched).
 
 ### Migration Path
 
 - **Backwards compatible / additive.** Default behavior is unchanged: with no
-  new configuration, no events are sent.
+  new configuration, no events are sent, and the OSS gateway is byte-for-byte
+  unchanged.
 - **Rollout of download tracking** requires updating the documented `docker
   pull` command to the Scarf domain. This should be done under an official
   DocumentDB-owned Scarf domain; the image path after the domain must exactly
   match the registry path (a Scarf/OCI requirement).
-- **Rollback:** disable via env/JSON (or ship with default off), and revert the
+- **Rollback:** disable via env/flag (or ship with default off), and revert the
   documented pull command to the direct registry URL. No data migration.
 
 ### Documentation Updates
 
-- New top-level `TELEMETRY.md` describing, in full: the two separate systems,
-  the exact two events and every field, what is never collected, all
-  configuration/opt-out controls, and design guarantees.
-- README: note telemetry is optional and off by default, link to `TELEMETRY.md`,
-  and (at rollout) present the Scarf-fronted pull command for download tracking.
+- New `TELEMETRY.md` (documentdb-local) describing, in full: the two separate
+  systems, the exact two events and every field, what is never collected, all
+  configuration/opt-out controls, that it applies only to `documentdb-local`
+  (not the OSS gateway), and design guarantees.
+- README: note usage analytics is optional, off by default, and scoped to
+  `documentdb-local`; link to `TELEMETRY.md`; and (at rollout) present the
+  Scarf-fronted pull command for download tracking.
 - CONTRIBUTING/SECURITY as needed to reference the telemetry policy.
 
 ---
@@ -344,27 +369,29 @@ None.
 
 ### Implementation PRs
 
-- [ ] PR #XXX: Add `telemetry/scarf.rs` (config, counters, launch + summary emitter)
-- [ ] PR #XXX: Integrate `Scarf` into `TelemetryConfig` / `TelemetryOptions`
-- [ ] PR #XXX: Hash user-defined identifiers in gateway metrics (`hash_identifier`)
-- [ ] PR #XXX: Decouple per-request recording so Scarf works without OTLP enabled
-- [ ] PR #XXX: Initialize Scarf telemetry at gateway startup
+- [ ] PR #XXX: Add `documentdb-local/scripts/scarf_telemetry.sh` (config resolution, launch + heartbeat emitter)
+- [ ] PR #XXX: Wire the emitter into `emulator_entrypoint.sh` (startup + cleanup trap) and add the `--enable-usage-analytics` flag
+- [ ] PR #XXX: Extend `documentdb_local_tests/test_image.py` with launch/heartbeat and opt-out assertions
 - [ ] PR #XXX: Add `TELEMETRY.md` and README/CONTRIBUTING updates
 - [ ] PR #XXX: Register official DocumentDB Scarf domain; update documented pull command
 
 ### Status Updates
 
-**2026-07-29:** RFC drafted. Prototype emitter, identifier hashing, and the
-per-request recording decoupling implemented and validated end-to-end against a
-local sink (launch + aggregated summary observed; disabled/opt-out paths send
-nothing).
+**2026-07-29:** RFC drafted.
+
+**2026-09-04:** Revised to scope runtime telemetry to the `documentdb-local`
+entrypoint scripts only. The OSS gateway (`pg_documentdb_gw`) is explicitly out
+of scope because it runs in production (including hosted pgmongo); no gateway
+code, dependencies, or metrics are changed. Runtime telemetry is now a
+launch + heartbeat emitter shell script; the earlier gateway-instrumented
+document-throughput summary and identifier-hashing changes were removed.
 
 ### Open Questions
 
 - [ ] **Official Scarf organization/domain.** Who owns the
       `documentdb.gateway.scarf.sh` domain and the Event Collection package?
       This must be an org-owned account (not a personal one) before release.
-- [ ] **Default summary interval.** Is hourly the right cadence, or should the
+- [ ] **Default heartbeat interval.** Is hourly the right cadence, or should the
       first release use a longer interval (e.g., daily) to minimize traffic?
 - [ ] **Enablement policy.** Ship off-by-default only, or off-by-default with a
       prominent first-run notice? (This RFC assumes off-by-default, opt-in.)
@@ -376,6 +403,28 @@ nothing).
 
 ### Implementation Notes
 
+- **Decision [2026-09-04]: Scope runtime telemetry to `documentdb-local`; do not
+  touch the OSS gateway.**
+  - **Context:** The OSS gateway (`pg_documentdb_gw`) runs in production
+    environments (including hosted pgmongo). Emitting adoption telemetry from the
+    production request path is inappropriate and risky. `documentdb-local` is the
+    artifact actually distributed for adoption, so telemetry belongs in its
+    entrypoint scripts.
+  - **Result:** No gateway code, dependencies (`reqwest`), or OTLP metrics are
+    changed. The emitter is a shell script using `curl`.
+  - **Alternatives:** Instrumenting the gateway with in-process counters
+    (rejected: leaks adoption telemetry into production and couples the two
+    concerns).
+
+- **Decision [2026-09-04]: Launch + heartbeat instead of a document-throughput
+  summary.**
+  - **Context:** The entrypoint script has no visibility into the gateway's
+    request path, so per-operation document counts are not available without
+    instrumenting the gateway (explicitly out of scope).
+  - **Result:** Runtime telemetry sends a one-time launch event and periodic
+    heartbeats carrying only fixed host attributes — enough to count running
+    deployments by version/platform, with zero request-path data.
+
 - **Decision [2026-07-29]: Separate Scarf emitter from OTLP.**
   - **Context:** OTLP metrics are high-frequency operational data for operators;
     Scarf events are coarse adoption signals for maintainers. Scarf accepts only
@@ -383,13 +432,6 @@ nothing).
   - **Alternatives:** Bridging OTLP metrics into Scarf (rejected: wrong shape,
     high cardinality, values become strings in Scarf, and it would leak
     user-defined labels).
-
-- **Decision [2026-07-29]: Hash user-defined identifiers at the source.**
-  - **Context:** Ensures raw database/collection names never enter any telemetry
-    attribute, including operators' own OTLP backends.
-  - **Tradeoff:** Operators lose plaintext names in their own metrics. Accepted
-    as a privacy-first default; a boundary-only hashing variant could be
-    considered later if operators need plaintext locally.
 
 - **Decision [2026-07-29]: Off by default, opt-in, fire-and-forget.**
   - **Context:** Runtime telemetry from a user's process must never surprise,
