@@ -46,7 +46,7 @@ deployment, and container registries (GHCR) expose little usable analytics.
 1. A privacy-respecting way to measure **real running deployments** (not just
    downloads), broken down by version and platform.
 2. A way to measure **downloads** of the published artifacts.
-3. **Off by default**, opt-in, with a standard opt-out that always wins.
+3. **On by default**, opt-out, with a standard opt-out that always wins.
 4. **Zero data** about user content, queries, schema names, or credentials.
 5. **No cost** to the project or to users.
 6. Fully auditable in the open-source tree.
@@ -104,9 +104,12 @@ version/platform. Together they give an adoption funnel (downloaded → run).
 ### Key tradeoffs
 
 - **Runtime telemetry is inherently a network call from the container.**
-  We mitigate this by making it **off by default**, opt-in, low-frequency,
-  fire-and-forget, and fully documented — following Scarf's own best-practice
-  guidance (low-frequency, high-intent events only).
+  We mitigate this by making it low-frequency, fire-and-forget, and fully
+  documented, and by honoring a standard, always-winning opt-out
+  (`DO_NOT_TRACK` / `SCARF_NO_ANALYTICS`) — following Scarf's own best-practice
+  guidance (low-frequency, high-intent events only). It is enabled by default
+  (opt-out) so adoption numbers reflect real usage rather than the small
+  fraction who would explicitly opt in.
 - **A user-facing documentation change** is required for download tracking (the
   published pull command must point at the Scarf domain). This is a
   one-line, reversible change with no code impact.
@@ -148,7 +151,7 @@ are controlled independently and send to different destinations.
 | Destination | An endpoint the operator configures (Prometheus, Grafana, App Insights) | Scarf Event Collection endpoint |
 | Granularity | Per-request, high-cardinality | Low-frequency (launch + heartbeat) |
 | Toggle | `OTEL_METRICS_ENABLED` (+ `OTEL_*`) | `SCARF_ANALYTICS_ENABLED` |
-| Default | Off | Off |
+| Default | Off | On (opt-out) |
 
 The rest of this section specifies the Scarf usage telemetry.
 
@@ -220,10 +223,15 @@ overrides everything.
 
 | Setting | Env var | Entrypoint flag | Default |
 |---------|---------|-----------------|---------|
-| Enable | `SCARF_ANALYTICS_ENABLED` | `--enable-usage-analytics` | `false` |
+| Enable | `SCARF_ANALYTICS_ENABLED` | `--usage-analytics [true\|false]` | `true` (on) |
 | Endpoint | `SCARF_TELEMETRY_ENDPOINT` | — | `https://documentdb.gateway.scarf.sh/telemetry` |
 | Heartbeat interval (s) | `SCARF_HEARTBEAT_INTERVAL_S` | — | `3600` (1 hour) |
-| Opt out | `DO_NOT_TRACK=1` **or** `SCARF_NO_ANALYTICS=1` | — | not set |
+| Opt out | `DO_NOT_TRACK=1` **or** `SCARF_NO_ANALYTICS=1` | `--disable-usage-analytics` | not set |
+
+Usage analytics is **on by default (opt-out)**. Setting
+`SCARF_ANALYTICS_ENABLED=false`, passing `--disable-usage-analytics`, or setting
+either standard opt-out variable (`DO_NOT_TRACK=1` / `SCARF_NO_ANALYTICS=1`)
+disables it; the opt-out always wins over any enable.
 
 This Scarf usage-analytics toggle is separate from the existing
 `--enable-telemetry` / `ENABLE_TELEMETRY` flag (which controls the gateway's
@@ -257,8 +265,8 @@ harmlessly.
 **Wiring.** `emulator_entrypoint.sh` starts the emitter as a background process
 after the gateway is confirmed ready, and adds its PID to the existing `cleanup`
 trap so it is terminated on container shutdown alongside the other background
-processes. When analytics is disabled or opted out, the emitter script exits
-immediately and no background loop is started.
+processes. When analytics is disabled (default is on) or opted out, the emitter
+script exits immediately and no background loop is started.
 
 **Fire-and-forget safety.** Every request is a backgrounded `curl` with a
 3-second timeout; all output and errors are discarded (redirected to
@@ -270,9 +278,9 @@ client request latency.
 
 - No changes to any user-facing database API, wire protocol, or UDFs.
 - No changes to the OSS gateway (`pg_documentdb_gw`) or its public Rust API.
-- The only additions are container-level: a new entrypoint flag
-  (`--enable-usage-analytics`) and new environment variables consumed by the
-  `documentdb-local` scripts.
+- The only additions are container-level: new entrypoint flags
+  (`--usage-analytics [true|false]` / `--disable-usage-analytics`) and new
+  environment variables consumed by the `documentdb-local` scripts.
 
 ### Database Schema Changes
 
@@ -280,12 +288,14 @@ None.
 
 ### Configuration Changes
 
-- New `documentdb-local` entrypoint flag `--enable-usage-analytics` (off by
-  default).
+- New `documentdb-local` entrypoint flags `--usage-analytics [true|false]` and
+  `--disable-usage-analytics` (analytics is on by default; either the `false`
+  form or the disable flag turns it off).
 - New environment variables consumed by the entrypoint scripts:
   `SCARF_ANALYTICS_ENABLED`, `SCARF_TELEMETRY_ENDPOINT`,
   `SCARF_HEARTBEAT_INTERVAL_S`.
-- Honors existing/standard `DO_NOT_TRACK` and `SCARF_NO_ANALYTICS`.
+- Honors existing/standard `DO_NOT_TRACK` and `SCARF_NO_ANALYTICS`, which always
+  win over the default-on behavior.
 - No new build/runtime dependency: the emitter uses `curl`, which is already
   present in the `documentdb-local` image.
 
@@ -322,16 +332,16 @@ None.
 ### Testing Strategy
 
 - **Script unit tests:** the emitter script resolves configuration correctly —
-  default-disabled; enabled via `SCARF_ANALYTICS_ENABLED` or
-  `--enable-usage-analytics`; opt-out (`DO_NOT_TRACK` / `SCARF_NO_ANALYTICS`)
-  overrides explicit enable; endpoint default vs. override; host attributes are
-  populated from `/version.txt` and `uname`.
+  default-enabled; disabled via `SCARF_ANALYTICS_ENABLED=false` or
+  `--disable-usage-analytics`; opt-out (`DO_NOT_TRACK` / `SCARF_NO_ANALYTICS`)
+  overrides an explicit enable; endpoint default vs. override; host attributes
+  are populated from `/version.txt` and `uname`.
 - **Integration test** (extending the existing container test harness in
   `documentdb-local/scripts/documentdb_local_tests/test_image.py`, which already
-  exercises telemetry-endpoint behavior): with analytics enabled and pointed at
-  a local HTTP sink, assert an `emulator_launch` event on startup and an
+  exercises telemetry-endpoint behavior): with the default configuration pointed
+  at a local HTTP sink, assert an `emulator_launch` event on startup and an
   `emulator_heartbeat` within one interval; assert **no** events are emitted
-  when disabled or when `DO_NOT_TRACK=1`.
+  when disabled (`SCARF_ANALYTICS_ENABLED=false`) or when `DO_NOT_TRACK=1`.
 - **Privacy assertion:** verify emitted payloads contain only the fixed host
   attributes and none of: database name, collection name, user name, document
   content.
@@ -340,15 +350,19 @@ None.
 
 ### Migration Path
 
-- **Backwards compatible / additive.** Default behavior is unchanged: with no
-  new configuration, no events are sent, and the OSS gateway is byte-for-byte
-  unchanged.
+- **Additive, but changes default behavior.** Usage analytics is on by default,
+  so upgrading to a release that includes it will begin emitting launch +
+  heartbeat events from `documentdb-local` unless the operator opts out. The OSS
+  gateway is byte-for-byte unchanged. This default-on change should be called
+  out prominently in the release notes.
 - **Rollout of download tracking** requires updating the documented `docker
   pull` command to the Scarf domain. This should be done under an official
   DocumentDB-owned Scarf domain; the image path after the domain must exactly
   match the registry path (a Scarf/OCI requirement).
-- **Rollback:** disable via env/flag (or ship with default off), and revert the
-  documented pull command to the direct registry URL. No data migration.
+- **Rollback / opt-out:** disable via env/flag
+  (`SCARF_ANALYTICS_ENABLED=false`, `--disable-usage-analytics`,
+  `DO_NOT_TRACK=1`, or `SCARF_NO_ANALYTICS=1`), and revert the documented pull
+  command to the direct registry URL. No data migration.
 
 ### Documentation Updates
 
@@ -356,9 +370,9 @@ None.
   systems, the exact two events and every field, what is never collected, all
   configuration/opt-out controls, that it applies only to `documentdb-local`
   (not the OSS gateway), and design guarantees.
-- README: note usage analytics is optional, off by default, and scoped to
-  `documentdb-local`; link to `TELEMETRY.md`; and (at rollout) present the
-  Scarf-fronted pull command for download tracking.
+- README: note usage analytics is on by default (opt-out) and scoped to
+  `documentdb-local`, show how to opt out, link to `TELEMETRY.md`; and (at
+  rollout) present the Scarf-fronted pull command for download tracking.
 - CONTRIBUTING/SECURITY as needed to reference the telemetry policy.
 
 ---
@@ -370,7 +384,7 @@ None.
 ### Implementation PRs
 
 - [ ] PR #XXX: Add `documentdb-local/scripts/scarf_telemetry.sh` (config resolution, launch + heartbeat emitter)
-- [ ] PR #XXX: Wire the emitter into `emulator_entrypoint.sh` (startup + cleanup trap) and add the `--enable-usage-analytics` flag
+- [ ] PR #XXX: Wire the emitter into `emulator_entrypoint.sh` (startup + cleanup trap) and add the `--usage-analytics` / `--disable-usage-analytics` flags (default on)
 - [ ] PR #XXX: Extend `documentdb_local_tests/test_image.py` with launch/heartbeat and opt-out assertions
 - [ ] PR #XXX: Add `TELEMETRY.md` and README/CONTRIBUTING updates
 - [ ] PR #XXX: Register official DocumentDB Scarf domain; update documented pull command
@@ -384,7 +398,9 @@ entrypoint scripts only. The OSS gateway (`pg_documentdb_gw`) is explicitly out
 of scope because it runs in production (including hosted pgmongo); no gateway
 code, dependencies, or metrics are changed. Runtime telemetry is now a
 launch + heartbeat emitter shell script; the earlier gateway-instrumented
-document-throughput summary and identifier-hashing changes were removed.
+document-throughput summary and identifier-hashing changes were removed. Also
+changed the default to **on (opt-out)** so adoption numbers reflect real usage;
+the standard opt-out controls always win.
 
 ### Open Questions
 
@@ -393,8 +409,10 @@ document-throughput summary and identifier-hashing changes were removed.
       This must be an org-owned account (not a personal one) before release.
 - [ ] **Default heartbeat interval.** Is hourly the right cadence, or should the
       first release use a longer interval (e.g., daily) to minimize traffic?
-- [ ] **Enablement policy.** Ship off-by-default only, or off-by-default with a
-      prominent first-run notice? (This RFC assumes off-by-default, opt-in.)
+- [ ] **Enablement policy.** This RFC assumes **on by default (opt-out)** with a
+      prominent first-run notice and documented opt-out. Confirm this is
+      acceptable to the TSC, and finalize the wording/placement of the first-run
+      notice.
 - [ ] **Namespace consistency.** The image is published under more than one
       registry namespace; download tracking must front whichever path the
       README advertises (or track multiple).
@@ -438,3 +456,15 @@ document-throughput summary and identifier-hashing changes were removed.
     block, or fail the workload.
   - **Result:** Disabled unless explicitly enabled; `DO_NOT_TRACK` /
     `SCARF_NO_ANALYTICS` always win; 3-second timeout; all errors ignored.
+  - **Superseded by** the 2026-09-04 decision below.
+
+- **Decision [2026-09-04]: On by default (opt-out), fire-and-forget.**
+  - **Context:** Opt-in telemetry captures only a small, self-selected fraction
+    of deployments, which undercounts adoption. Because the payload contains
+    only fixed host attributes (no user data), default-on is low-risk.
+  - **Result:** Enabled by default; disabled via `SCARF_ANALYTICS_ENABLED=false`
+    or `--disable-usage-analytics`; the standard opt-out (`DO_NOT_TRACK` /
+    `SCARF_NO_ANALYTICS`) always wins; 3-second timeout; all errors ignored.
+  - **Supersedes:** the 2026-07-29 off-by-default/opt-in decision.
+  - **Mitigations:** prominent first-run notice, documented opt-out in README
+    and `TELEMETRY.md`, and a release-note callout of the default-on behavior.
